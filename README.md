@@ -45,7 +45,7 @@
 **צריך:** שרת עם Docker ו־Docker Compose.
 
 ```bash
-git clone https://github.com/<user>/tg-downloader.git
+git clone https://github.com/gluckgraphic-cell/tg-downloader.git
 cd tg-downloader
 cp .env.example .env
 ```
