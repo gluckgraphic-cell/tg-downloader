@@ -414,24 +414,81 @@ async def make_folder(body: FolderIn):
     return {"path": rel_of(p)}
 
 
+CHAT_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:s/)?(c/)?([A-Za-z0-9_]+)/?(?:\?.*)?$"
+)
+ANY_MSG_LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:s/)?(?:c/)?[A-Za-z0-9_]+/\d+(?:/\d+)?"
+)
+thumb_cache: Dict[str, bytes] = {}
+
+
+def parse_chat_link(link: str):
+    """t.me/name or t.me/c/123 (no message id) -> (chat, label). None if it is not a chat link."""
+    m = CHAT_RE.match(link.strip())
+    if not m or m.group(2).lower() in ("joinchat", "addstickers", "share", "proxy"):
+        return None
+    private, chat = m.groups()
+    return (PeerChannel(int(chat)), f"c{chat}") if private else (chat, chat)
+
+
+def msg_link(label: str, msg_id: int) -> str:
+    return f"https://t.me/c/{label[1:]}/{msg_id}" if re.fullmatch(r"c\d+", label) else f"https://t.me/{label}/{msg_id}"
+
+
+async def open_chat(c: TelegramClient, chat):
+    try:
+        return await resolve_chat(c, chat)
+    except (errors.ChannelPrivateError, errors.ChannelInvalidError):
+        raise HTTPException(403, "אין גישה לערוץ. צריך להיות חבר בו בחשבון הזה")
+    except (ValueError, TypeError, errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
+        raise HTTPException(404, "הערוץ לא נמצא (בערוץ פרטי צריך להיות חבר בו)")
+
+
+def item_of(m, label: str, fallback: str) -> dict:
+    return {
+        "link": msg_link(label, m.id), "id": m.id, "name": media_name(m, label, fallback),
+        "size": m.file.size or 0, "kind": kind_of(m), "duration": getattr(m.file, "duration", None),
+        "date": m.date.timestamp() if m.date else None,
+        "caption": (m.message or "").strip().splitlines()[0][:140] if (m.message or "").strip() else "",
+    }
+
+
+async def enqueue(m, label: str, folder: Path, link: str) -> str:
+    target = unique_path(folder, media_name(m, label, folder.name if folder != DOWNLOAD_ROOT else ""))
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {
+        "id": job_id, "link": link, "name": target.name,
+        "folder": rel_of(folder), "kind": kind_of(m), "size": m.file.size or 0,
+        "done": 0, "speed": 0, "status": "queued", "error": None,
+        "created": time.time(), "thumb": await thumb_data(m),
+        "duration": getattr(m.file, "duration", None),
+        "caption": (m.message or "")[:500], "msg_id": m.id,
+    }
+    tasks[job_id] = asyncio.create_task(run_job(job_id, m, target))
+    return job_id
+
+
+def target_folder(rel: str) -> Path:
+    folder = safe_dir(rel)
+    if not folder.is_dir():
+        raise HTTPException(400, "תיקיית היעד לא קיימת")
+    return folder
+
+
 @app.post("/api/download", dependencies=[Depends(check_auth)])
 async def download(body: DownloadIn):
     c = await require_login()
+    if parse_chat_link(body.link):
+        return {"browse": True}  # a channel/group link: the UI opens the picker instead
     try:
         chat, msg_id, label = parse_link(body.link)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    folder = safe_dir(body.folder)
-    if not folder.is_dir():
-        raise HTTPException(400, "תיקיית היעד לא קיימת")
+    folder = target_folder(body.folder)
 
-    try:
-        entity = await resolve_chat(c, chat)
-        msg = await c.get_messages(entity, ids=msg_id)
-    except (errors.ChannelPrivateError, errors.ChannelInvalidError):
-        raise HTTPException(403, "אין גישה לערוץ. צריך להיות חבר בו בחשבון הזה")
-    except (ValueError, errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
-        raise HTTPException(404, "הערוץ לא נמצא")
+    entity = await open_chat(c, chat)
+    msg = await c.get_messages(entity, ids=msg_id)
     if not msg:
         raise HTTPException(404, "ההודעה לא נמצאה (אולי נמחקה)")
 
@@ -441,24 +498,130 @@ async def download(body: DownloadIn):
         msgs = [m for m in around if m and m.grouped_id == msg.grouped_id]
     msgs = [m for m in msgs if m.media and m.file]
     if not msgs:
+        # A post that lists other posts ("index" message) -> let the user pick from them
+        if len(ANY_MSG_LINK_RE.findall(msg.message or "")) >= 1 or any(
+                getattr(e, "url", None) for e in (msg.entities or [])):
+            return {"browse": True}
         raise HTTPException(400, "אין בהודעה הזו קובץ להורדה")
 
-    created = []
-    for m in msgs:
-        target = unique_path(folder, media_name(m, label, folder.name if folder != DOWNLOAD_ROOT else ""))
-        job_id = uuid.uuid4().hex[:12]
-        jobs[job_id] = {
-            "id": job_id, "link": body.link.strip(), "name": target.name,
-            "folder": rel_of(folder), "kind": kind_of(m), "size": m.file.size or 0,
-            "done": 0, "speed": 0, "status": "queued", "error": None,
-            "created": time.time(), "thumb": await thumb_data(m),
-            "duration": getattr(m.file, "duration", None),
-            "caption": (m.message or "")[:500], "msg_id": m.id,
-        }
-        tasks[job_id] = asyncio.create_task(run_job(job_id, m, target))
-        created.append(job_id)
+    created = [await enqueue(m, label, folder, body.link.strip() if len(msgs) == 1 else msg_link(label, m.id))
+               for m in msgs]
     save_history()
     return {"jobs": created}
+
+
+class BrowseIn(BaseModel):
+    link: str
+    offset_id: int = 0
+    limit: int = 60
+
+
+@app.post("/api/browse", dependencies=[Depends(check_auth)])
+async def browse(body: BrowseIn):
+    """List downloadable files: every media message of a channel/group, or the posts an index message links to."""
+    c = await require_login()
+    limit = max(1, min(body.limit, 200))
+    chat_link = parse_chat_link(body.link)
+    if chat_link:
+        chat, label = chat_link
+        entity = await open_chat(c, chat)
+        full = await c.get_entity(entity)
+        title = getattr(full, "title", None) or getattr(full, "first_name", "") or label
+        items, last_id, scanned = [], body.offset_id, 0
+        async for m in c.iter_messages(entity, offset_id=body.offset_id, limit=limit * 8):
+            scanned += 1
+            last_id = m.id
+            if m.media and m.file and not m.web_preview:
+                items.append(item_of(m, label, title))
+                if len(items) >= limit:
+                    break
+        more = bool(items) and len(items) >= limit or (scanned >= limit * 8)
+        return {"title": title, "kind": "chat", "items": items, "next": last_id if more else None}
+
+    # an index post: collect the message links inside it (text + hidden link entities)
+    try:
+        chat, msg_id, label = parse_link(body.link)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    entity = await open_chat(c, chat)
+    msg = await c.get_messages(entity, ids=msg_id)
+    if not msg:
+        raise HTTPException(404, "ההודעה לא נמצאה")
+    urls = ANY_MSG_LINK_RE.findall(msg.message or "")
+    urls += [e.url for e in (msg.entities or []) if getattr(e, "url", None) and ANY_MSG_LINK_RE.search(e.url)]
+    seen, pairs = set(), []
+    for u in urls:
+        try:
+            ch, mid, lb = parse_link(u)
+        except ValueError:
+            continue
+        if (lb, mid) not in seen:
+            seen.add((lb, mid))
+            pairs.append((ch, mid, lb))
+    pairs = pairs[:300]
+    groups: Dict[str, list] = {}
+    for ch, mid, lb in pairs:
+        groups.setdefault(lb, [ch, []])[1].append(mid)
+    found: Dict[tuple, dict] = {}
+    for lb, (ch, mids) in groups.items():
+        try:
+            ent = await resolve_chat(c, ch)
+            ms = await c.get_messages(ent, ids=mids)
+        except Exception:
+            continue
+        for m in ms:
+            if m and m.media and m.file and not m.web_preview:
+                found[(lb, m.id)] = item_of(m, lb, "")
+    items = [found[(lb, mid)] for _, mid, lb in pairs if (lb, mid) in found]
+    title = (msg.message or "").strip().splitlines()[0][:80] if (msg.message or "").strip() else "רשימת קבצים"
+    return {"title": title, "kind": "index", "items": items, "next": None}
+
+
+class ManyIn(BaseModel):
+    links: List[str]
+    folder: str = ""
+
+
+@app.post("/api/download-many", dependencies=[Depends(check_auth)])
+async def download_many(body: ManyIn):
+    c = await require_login()
+    folder = target_folder(body.folder)
+    groups: Dict[str, list] = {}
+    for link in body.links[:500]:
+        try:
+            ch, mid, lb = parse_link(link)
+        except ValueError:
+            continue
+        groups.setdefault(lb, [ch, []])[1].append(mid)
+    created = []
+    for lb, (ch, mids) in groups.items():
+        ent = await open_chat(c, ch)
+        for i in range(0, len(mids), 100):
+            for m in await c.get_messages(ent, ids=mids[i:i + 100]):
+                if m and m.media and m.file:
+                    created.append(await enqueue(m, lb, folder, msg_link(lb, m.id)))
+    save_history()
+    return {"jobs": created}
+
+
+@app.get("/api/thumb", dependencies=[Depends(check_auth)])
+async def thumb(link: str):
+    from fastapi.responses import Response
+    if link in thumb_cache:
+        return Response(thumb_cache[link], media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
+    c = await require_login()
+    try:
+        ch, mid, _ = parse_link(link)
+        m = await c.get_messages(await resolve_chat(c, ch), ids=mid)
+        data = await c.download_media(m, thumb=-1, file=bytes) if m else None
+    except Exception:
+        data = None
+    if not data:
+        raise HTTPException(404, "no thumb")
+    if len(thumb_cache) > 600:
+        thumb_cache.pop(next(iter(thumb_cache)))
+    thumb_cache[link] = data
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
 
 
 @app.get("/api/jobs", dependencies=[Depends(check_auth)])
