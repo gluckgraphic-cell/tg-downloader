@@ -1,0 +1,13 @@
+services:
+  tg-downloader:
+    build: .
+    image: tg-downloader:latest
+    container_name: tg-downloader
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"   # the files you download will belong to this user
+    env_file: .env
+    ports:
+      - "${PORT:-8765}:8080"
+    volumes:
+      - ./data:/data                                # Telegram login + download history
+      - ${DOWNLOADS_PATH:-./downloads}:/downloads   # the root you pick download folders from

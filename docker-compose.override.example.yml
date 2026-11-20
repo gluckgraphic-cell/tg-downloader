@@ -1,0 +1,9 @@
+# Optional: copy to docker-compose.override.yml to expose several folders as destinations
+# (docker compose merges it automatically). Example for a NAS:
+services:
+  tg-downloader:
+    group_add:
+      - "100"            # extra group, e.g. "users"
+    volumes:
+      - /volume1/Media:/downloads/Media
+      - /volume1/Downloads:/downloads/Downloads
