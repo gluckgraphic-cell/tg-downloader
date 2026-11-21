@@ -208,7 +208,10 @@ header{display:flex;align-items:center;gap:12px;padding:8px 16px;height:56px;bac
 .bmore{display:block;width:calc(100% - 32px);margin:8px 16px 14px;height:42px;border-radius:12px;color:var(--accent);font-weight:600;background:var(--accent-soft)}
 .bfoot{display:flex;gap:8px;align-items:center;padding:10px 16px;border-top:1px solid var(--line)}
 .bfoot .chip{box-shadow:none;background:var(--accent-soft);flex:0 1 auto;min-width:0}
-.bfoot .btn{flex:1 0 auto;min-width:140px}
+.bfoot .btn{flex:1 0 auto;min-width:120px}
+.bfoot{flex-wrap:wrap}
+#bSeasons{flex:none}
+#bSeasons span{direction:rtl}
 .spinner{width:28px;height:28px;border-radius:50%;border:3px solid var(--accent-soft);border-top-color:var(--accent);animation:rot .8s linear infinite;margin:40px auto}
 @keyframes rot{to{transform:rotate(360deg)}}
 </style>
@@ -255,6 +258,7 @@ header{display:flex;align-items:center;gap:12px;padding:8px 16px;height:56px;bac
     <div class="list" id="bList"></div>
     <div class="bfoot">
       <button class="chip" id="bFolder" title="יעד ההורדה"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z"/></svg><span id="bFolderName">/</span></button>
+      <button class="chip" id="bSeasons" title="כל פרק נכנס לתיקיית Season לפי העונה שבשם"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M8 13h8M8 17h5"/></svg><span>לפי עונות</span></button>
       <button class="btn" id="bGo" disabled>הורדה</button>
     </div>
   </div>
@@ -288,9 +292,9 @@ header{display:flex;align-items:center;gap:12px;padding:8px 16px;height:56px;bac
 
 <script>
 const $ = s => document.querySelector(s);
-const state = { folder: '', album: true, jobs: [], step: 'phone', pickPath: '' };
-try { const s = JSON.parse(localStorage.getItem('tgdl') || '{}'); Object.assign(state, {folder: s.folder || '', album: s.album !== false}); } catch {}
-const persist = () => { try { localStorage.setItem('tgdl', JSON.stringify({folder: state.folder, album: state.album})); } catch {} };
+const state = { folder: '', album: true, seasons: true, jobs: [], step: 'phone', pickPath: '' };
+try { const s = JSON.parse(localStorage.getItem('tgdl') || '{}'); Object.assign(state, {folder: s.folder || '', album: s.album !== false, seasons: s.seasons !== false}); } catch {}
+const persist = () => { try { localStorage.setItem('tgdl', JSON.stringify({folder: state.folder, album: state.album, seasons: state.seasons})); } catch {} };
 
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: {'Content-Type': 'application/json'}, ...opts,
@@ -468,7 +472,12 @@ function bRender() {
 }
 function bCount() {
   const sel = B.items.filter(i => B.sel.has(i.link)), size = sel.reduce((a, i) => a + (i.size || 0), 0);
-  $('#bCount').textContent = sel.length ? `נבחרו ${sel.length} · ${fmtSize(size)}` : `${B.items.length} קבצים`;
+  const ss = new Set(sel.map(i => (i.name.match(/S(\d+)E\d+/i) || [])[1]).filter(Boolean).map(Number));
+  const isSeasonDir = /^(season|עונה|s)\s*\d+$/i.test((state.folder.split('/').pop() || '').trim());
+  const split = state.seasons && ss.size && !isSeasonDir;
+  $('#bCount').textContent = sel.length ? `נבחרו ${sel.length} · ${fmtSize(size)}` + (split ? ` · ${ss.size === 1 ? 'עונה אחת' : ss.size + ' עונות'}` : '') : `${B.items.length} קבצים`;
+  $('#bSeasons').classList.toggle('off', !state.seasons);
+  $('#bSeasons span').textContent = state.seasons ? 'לפי עונות' : 'בלי חלוקה';
   const items = shown();
   $('#bAll').textContent = items.length && items.every(i => B.sel.has(i.link)) ? 'ביטול הבחירה' : (B.q ? 'בחירת התוצאות' : 'בחירת הכל');
   $('#bGo').disabled = !sel.length;
@@ -509,12 +518,15 @@ $('#bList').addEventListener('click', e => {
   row.classList.toggle('on', B.sel.has(l)); bCount();
 });
 $('#bFolder').addEventListener('click', () => openPicker(state.folder));
+$('#bSeasons').addEventListener('click', () => { state.seasons = !state.seasons; persist(); bCount(); });
 $('#bGo').addEventListener('click', async () => {
   const links = B.items.filter(i => B.sel.has(i.link)).map(i => i.link); if (!links.length) return;
   const btn = $('#bGo'); btn.disabled = true; btn.textContent = 'מוסיף לתור…';
   try {
-    const r = await api('/api/download-many', {method: 'POST', body: {links, folder: state.folder}});
-    closeBrowser(); toast(`נוספו ${r.jobs.length} קבצים לתור`);
+    const r = await api('/api/download-many', {method: 'POST', body: {links, folder: state.folder, seasons: state.seasons}});
+    closeBrowser();
+    const sn = (r.seasons || []).map(p => p.split('/').pop());
+    toast(`נוספו ${r.jobs.length} קבצים לתור` + (sn.length ? ` · ${sn.join(', ')}` : ''));
     const chat = $('#chat'); await poll(); chat.scrollTop = chat.scrollHeight;
   } catch (e) { toast(e.message); bCount(); }
 });
@@ -548,7 +560,7 @@ async function openPicker(path) {
 $('#folderChip').addEventListener('click', () => openPicker(state.folder));
 $('#picker').addEventListener('click', async e => {
   if (e.target.id === 'picker' || e.target.closest('#pickCancel')) return $('#picker').classList.add('hidden');
-  if (e.target.closest('#pickOk')) { state.folder = state.pickPath; persist(); renderChips(); $('#bFolderName').textContent = '/' + state.folder; return $('#picker').classList.add('hidden'); }
+  if (e.target.closest('#pickOk')) { state.folder = state.pickPath; persist(); renderChips(); bCount(); return $('#picker').classList.add('hidden'); }
   if (e.target.closest('#newDir')) {
     const name = prompt('שם התיקייה החדשה'); if (!name) return;
     try { const r = await api('/api/folders', {method: 'POST', body: {path: state.pickPath, name}}); openPicker(r.path); } catch (x) { toast(x.message); }
