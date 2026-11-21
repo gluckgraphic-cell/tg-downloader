@@ -454,8 +454,39 @@ def item_of(m, label: str, fallback: str) -> dict:
     }
 
 
-async def enqueue(m, label: str, folder: Path, link: str) -> str:
-    target = unique_path(folder, media_name(m, label, folder.name if folder != DOWNLOAD_ROOT else ""))
+SEASON_DIR_RE = re.compile(r"^(?:season|עונה|s)\s*0*(\d{1,3})$", re.I)
+
+
+def season_of(m) -> Optional[int]:
+    """Season number from the caption or the file name ('עונה 2', 'Season 2', 'S02E05'), else None."""
+    for text in (m.message or "", (m.file.name if m.file else "") or ""):
+        sxe = SXE_RE.search(text)
+        if sxe:
+            return int(sxe.group(1))
+        se = SEASON_RE.search(text)
+        if se:
+            return int(se.group(1))
+    # an episode number with no season ("פרק 7") is named S01E07, so it goes to Season 1 too
+    return 1 if EPISODE_RE.search(m.message or "") else None
+
+
+def season_dir(series_dir: Path, season: int) -> Path:
+    """Reuse an existing 'Season 2' / 'Season 02' / 'עונה 2' / 'S02' folder, else create 'Season 2'."""
+    try:
+        for d in series_dir.iterdir():
+            mm = SEASON_DIR_RE.match(d.name.strip())
+            if mm and int(mm.group(1)) == season and d.is_dir():
+                return d
+    except OSError:
+        pass
+    d = series_dir / f"Season {season}"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+async def enqueue(m, label: str, folder: Path, link: str, series: Optional[str] = None) -> str:
+    fallback = series if series is not None else (folder.name if folder != DOWNLOAD_ROOT else "")
+    target = unique_path(folder, media_name(m, label, fallback))
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {
         "id": job_id, "link": link, "name": target.name,
@@ -580,6 +611,7 @@ async def browse(body: BrowseIn):
 class ManyIn(BaseModel):
     links: List[str]
     folder: str = ""
+    seasons: bool = True   # put each episode into a "Season N" sub-folder
 
 
 @app.post("/api/download-many", dependencies=[Depends(check_auth)])
@@ -593,15 +625,23 @@ async def download_many(body: ManyIn):
         except ValueError:
             continue
         groups.setdefault(lb, [ch, []])[1].append(mid)
-    created = []
+    # don't nest if the chosen folder already is a season folder
+    split = body.seasons and not SEASON_DIR_RE.match(folder.name.strip())
+    series = folder.name if folder != DOWNLOAD_ROOT else ""
+    created, seasons = [], set()
     for lb, (ch, mids) in groups.items():
         ent = await open_chat(c, ch)
         for i in range(0, len(mids), 100):
             for m in await c.get_messages(ent, ids=mids[i:i + 100]):
                 if m and m.media and m.file:
-                    created.append(await enqueue(m, lb, folder, msg_link(lb, m.id)))
+                    dest = folder
+                    sn = season_of(m) if split else None
+                    if sn is not None:
+                        dest = season_dir(folder, sn)
+                        seasons.add(rel_of(dest))
+                    created.append(await enqueue(m, lb, dest, msg_link(lb, m.id), series))
     save_history()
-    return {"jobs": created}
+    return {"jobs": created, "seasons": sorted(seasons)}
 
 
 @app.get("/api/thumb", dependencies=[Depends(check_auth)])
